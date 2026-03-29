@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
 import warnings
 import time
 import requests
@@ -18,19 +17,16 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", 8080)) 
 
-# Ticker for Spot Gold ($4,495 range)
 TICKER = "XAUUSD=X" 
 INTERVAL = "15m"
 PERIOD = "59d"
 HORIZON = 12
 CONF_THRESHOLD = 0.55
 
-# Global variables for real-time interaction
 target_price = None
 calibration_offset = 0.0  
 last_update_id = 0
 
-# --- TELEGRAM CORE ---
 def send_telegram(message):
     if not TELEGRAM_TOKEN: return
     try:
@@ -39,8 +35,25 @@ def send_telegram(message):
         requests.post(url, data=payload, timeout=10)
     except: pass
 
+def get_accurate_price():
+    """Robust price fetcher that handles market-open gaps"""
+    global calibration_offset
+    # Try 1m first, then 2m, then 5m as fallbacks
+    for interval in ["1m", "2m", "5m"]:
+        try:
+            data = yf.download(TICKER, period="1d", interval=interval, progress=False)
+            if not data.empty:
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+                
+                # Fill gaps if the last minute was empty
+                price = data['Close'].ffill().iloc[-1]
+                return float(price) + calibration_offset
+        except:
+            continue
+    return None
+
 def command_listener():
-    """Independent thread for instant Telegram replies"""
     global target_price, last_update_id, calibration_offset
     print("📡 Telegram Listener Active...")
     
@@ -57,7 +70,7 @@ def command_listener():
                         try:
                             val = float(msg.split(" ")[1])
                             target_price = val
-                            send_telegram(f"🎯 **Target Set!**\nAlert at Spot Price: **${target_price:.2f}**")
+                            send_telegram(f"🎯 **Target Set!**\nAlert at: **${target_price:.2f}**")
                         except:
                             send_telegram("❌ Use: `/set 4495.50`")
                     
@@ -65,76 +78,53 @@ def command_listener():
                         try:
                             val = float(msg.split(" ")[1])
                             calibration_offset = val
-                            send_telegram(f"⚖️ **Calibrated!**\nOffset of `{calibration_offset:+.2f}` applied to all prices.")
+                            send_telegram(f"⚖️ **Calibrated!**\nOffset: `{calibration_offset:+.2f}`")
                         except:
-                            send_telegram("❌ Use: `/calibrate 0.05` or `/calibrate -0.10`")
+                            send_telegram("❌ Use: `/calibrate 0.05` or `-0.05`")
 
                     elif msg == "/stop":
                         target_price = None
                         send_telegram("🛑 **Target Cleared.**")
                     
                     elif msg == "/price":
-                        try:
-                            data = yf.download(TICKER, period="1d", interval="1m", progress=False)
-                            if not data.empty:
-                                if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
-                                raw_price = data['Close'].ffill().iloc[-1]
-                                final_price = float(raw_price) + calibration_offset
-                                send_telegram(f"💰 **Live Spot Gold:** ${final_price:.2f}")
-                            else:
-                                hist = yf.download(TICKER, period="5d", interval="1d", progress=False)
-                                if isinstance(hist.columns, pd.MultiIndex): hist.columns = hist.columns.get_level_values(0)
-                                price = hist['Close'].iloc[-1] + calibration_offset
-                                send_telegram(f"😴 **Market Offline:** ${float(price):.2f}")
-                        except:
-                            send_telegram("⚠️ Syncing... try again.")
+                        price = get_accurate_price()
+                        if price:
+                            send_telegram(f"💰 **Live Spot Gold:** ${price:.2f}")
+                        else:
+                            send_telegram("⚠️ Market is waking up. Please wait 60 seconds.")
 
                     elif msg == "/status":
                         status = f"Target: `{target_price if target_price else 'None'}`\nOffset: `{calibration_offset:+.2f}`"
                         send_telegram(f"🤖 **Bot Status**\n{status}")
 
                     elif msg == "/help":
-                        help_text = (
-                            "🆘 **Gold Bot Commands**\n\n"
-                            "💰 `/price` - Get the current spot price\n"
-                            "🎯 `/set XXXX` - Set a price alert (e.g., `/set 4500`)\n"
-                            "🛑 `/stop` - Clear your active alert\n"
-                            "⚖️ `/calibrate X.XX` - Adjust price by cents (e.g., `/calibrate 0.05`)\n"
-                            "📊 `/status` - Check current bot settings"
-                        )
-                        send_telegram(help_text)
+                        send_telegram("🆘 **Commands**\n/price - Live Price\n/set XXXX - Alert\n/calibrate X.XX - Fix cents\n/status - Settings")
             
             time.sleep(2)
         except: time.sleep(10)
 
-# --- AI & ANALYSIS ---
 def run_analysis(last_signal):
     global target_price
-    print(f"🕒 Market Check: {datetime.now().strftime('%H:%M:%S')}")
-    
     df = yf.download(TICKER, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
     if df is None or df.empty or len(df) < 100:
         return last_signal
 
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     
-    # Adjust price for calibration
     df['Close'] = df['Close'] + calibration_offset
     current_price = df['Close'].iloc[-1]
     
-    # Check manual target
     if target_price and current_price >= target_price:
-        send_telegram(f"🚀 **TARGET HIT!**\nSpot Gold is at **${current_price:.2f}**")
+        send_telegram(f"🚀 **TARGET HIT!**\nPrice: **${current_price:.2f}**")
         target_price = None
 
-    # Technical Indicators
+    # AI Logic
     df["RSI"] = 100 - (100 / (1 + (df['Close'].diff().where(lambda x: x>0, 0).rolling(14).mean() / 
                                    df['Close'].diff().where(lambda x: x<0, 0).abs().rolling(14).mean())))
     df["EMA"] = df["Close"].ewm(span=100, adjust=False).mean()
     df["ATR"] = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs()], axis=1).max(axis=1).rolling(14).mean()
     feat_data = df.dropna()
 
-    # AI Prediction
     future_change = (feat_data["Close"].shift(-HORIZON) - feat_data["Close"])
     feat_data["target"] = 1
     feat_data.loc[future_change > (feat_data["ATR"] * 0.5), "target"] = 2
@@ -156,11 +146,10 @@ def run_analysis(last_signal):
     elif probs[0] >= CONF_THRESHOLD and not trend_up: current_signal = "SELL"
 
     if current_signal != last_signal:
-        send_telegram(f"🔔 **AI SIGNAL**\nSpot Price: **${current_price:.2f}**\nAction: **{current_signal}**")
+        send_telegram(f"🔔 **AI SIGNAL**\nPrice: **${current_price:.2f}**\nAction: **{current_signal}**")
     
     return current_signal
 
-# --- RAILWAY SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers()
@@ -170,15 +159,13 @@ def main():
     threading.Thread(target=HTTPServer(('0.0.0.0', PORT), HealthCheckHandler).serve_forever, daemon=True).start()
     threading.Thread(target=command_listener, daemon=True).start()
     
-    print("🤖 Gold Spot Bot Fully Operational.")
+    print("🤖 Gold Bot Stable.")
     last_signal = "HOLD"
     while True:
         try:
             last_signal = run_analysis(last_signal)
             time.sleep(900)
-        except Exception as e:
-            print(f"Main Error: {e}")
-            time.sleep(60)
+        except: time.sleep(60)
 
 if __name__ == "__main__":
     main()
