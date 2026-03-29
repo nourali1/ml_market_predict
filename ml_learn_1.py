@@ -18,7 +18,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", 8080)) 
 
-TICKER = "GLD"
+# --- TICKER SET TO GOLD FUTURES ($4,495+) ---
+TICKER = "GC=F" 
 DXY_TICKER = "UUP"
 INTERVAL = "15m"
 PERIOD = "59d"
@@ -26,28 +27,50 @@ HORIZON = 12
 CONF_THRESHOLD = 0.55
 EMA_PERIOD = 100
 
-# --- DUMMY SERVER FOR RAILWAY HEALTH CHECKS ---
+# Global storage for your custom price alerts
+target_price = None
+last_update_id = 0
+
+# --- DUMMY SERVER FOR RAILWAY ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is Running")
+        self.wfile.write(b"Gold Bot is Active")
 
 def run_health_server():
     server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
     server.serve_forever()
 
-# --- NOTIFICATION ENGINE ---
+# --- TELEGRAM INTERACTION ---
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram credentials missing in Environment Variables!")
-        return
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         requests.post(url, data=payload)
-    except Exception as e:
-        print(f"❌ Telegram Error: {e}")
+    except Exception as e: print(f"Telegram Error: {e}")
+
+def check_remote_commands():
+    """Check Telegram for /set XXXX commands"""
+    global target_price, last_update_id
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id + 1}"
+        updates = requests.get(url).json()
+        if updates.get("result"):
+            for upd in updates["result"]:
+                last_update_id = upd["update_id"]
+                msg = upd.get("message", {}).get("text", "")
+                if msg.startswith("/set"):
+                    try:
+                        val = float(msg.split(" ")[1])
+                        target_price = val
+                        send_telegram(f"🎯 Target set! I'll alert you at **${target_price}**")
+                    except:
+                        send_telegram("❌ Use: `/set 4500`")
+                elif msg == "/status":
+                    send_telegram(f"🤖 Bot is running.\nTarget: {target_price if target_price else 'None'}")
+    except: pass
 
 # --- INDICATORS ---
 def get_rsi(series, period=14):
@@ -64,21 +87,23 @@ def get_atr(df, period=14):
 
 # --- ENGINE ---
 def run_analysis(last_signal):
-    print(f"🕒 Analyzing: {datetime.now().strftime('%H:%M:%S')}")
+    global target_price
+    check_remote_commands()
     
-    # 1. Fetch Data
+    print(f"🕒 Analyzing Gold Futures: {datetime.now().strftime('%H:%M:%S')}")
+    
+    # Fetch actual Gold Futures price
     df = yf.download(TICKER, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
     dxy = yf.download(DXY_TICKER, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
     
-    if df.empty or len(df) < 200:
-        print("⚠️ 15m data thin. Using 1h fallback...")
-        df = yf.download(TICKER, period="730d", interval="1h", progress=False, auto_adjust=True)
-        dxy = yf.download(DXY_TICKER, period="730d", interval="1h", progress=False, auto_adjust=True)
+    if df.empty or len(df) < 150:
+        print("⚠️ Waiting for more market data...")
+        return last_signal
 
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     df.index = df.index.tz_localize(None) if df.index.tz else df.index
 
-    # 2. Features
+    # Feature Logic
     df["dxy_ret"] = dxy["Close"].pct_change(5).ffill().fillna(0)
     df["RSI"] = get_rsi(df["Close"])
     df["ATR_pct"] = get_atr(df) / df["Close"]
@@ -87,66 +112,56 @@ def run_analysis(last_signal):
     df["is_ny"] = ((df.index.hour >= 13) & (df.index.hour <= 17)).astype(int)
     feat_data = df.dropna()
 
-    # 3. Target Labeling
+    # Target Labeling
     future_change = (feat_data["Close"].shift(-HORIZON) - feat_data["Close"]) / feat_data["Close"]
     feat_data["target"] = 1
     feat_data.loc[future_change > (feat_data["ATR_pct"] * 0.5), "target"] = 2
     feat_data.loc[future_change < -(feat_data["ATR_pct"] * 0.5), "target"] = 0
     train_df = feat_data.dropna()
 
-    # --- SAFETY VALVE: Ensure we have enough data to train ---
-    if len(train_df) < 50:
-        print(f"⚠️ Not enough samples ({len(train_df)}) for training. Markets likely closed.")
+    if len(train_df) < 50 or len(np.unique(train_df["target"])) < 2:
+        print("⚠️ Data too flat to train. Holding...")
         return last_signal
 
+    # AI Training
     features = ["RSI", "ATR_pct", "dist_ema", "dxy_ret", "is_ny"]
     X, y = train_df[features], train_df["target"]
-    
-    if len(np.unique(y)) < 2:
-        print("⚠️ Only one target class found in data. Skipping this cycle.")
-        return last_signal
-
-    # 4. Train Model
     X_train, _, y_train, _ = train_test_split(X, y, test_size=0.2, shuffle=False)
+    
     model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05, verbosity=0)
     model.fit(X_train, y_train)
 
-    # 5. Signal Logic
+    # Current Stats
     last_row = feat_data.iloc[-1:]
     probs = model.predict_proba(last_row[features])[0]
-    price = last_row['Close'].values[0]
-    trend_up = last_row['dist_ema'].values[0] > 0
+    current_price = last_row['Close'].values[0]
     
+    # Check manual target
+    if target_price:
+        if current_price >= target_price:
+            send_telegram(f"🚀 **TARGET REACHED!**\nGold is now **${current_price:.2f}**")
+            target_price = None
+
+    # Determine Signal
+    trend_up = last_row['dist_ema'].values[0] > 0
     current_signal = "HOLD"
     if probs[2] >= CONF_THRESHOLD and trend_up: current_signal = "BUY"
     elif probs[0] >= CONF_THRESHOLD and not trend_up: current_signal = "SELL"
 
-    # Notify only on change
     if current_signal != last_signal:
-        msg = f"🔔 *GOLD AI ALERT*\n\nSignal: *{current_signal}*\nPrice: ${price:.2f}\n\n📈 Up: {probs[2]:.1%}\n📉 Down: {probs[0]:.1%}"
+        msg = f"🔔 *NEW SIGNAL*\nPrice: **${current_price:.2f}**\nAction: **{current_signal}**"
         send_telegram(msg)
-        print(f"🚀 Telegram Sent: {current_signal}")
     
     return current_signal
 
-# --- MAIN LOOP ---
 def main():
     threading.Thread(target=run_health_server, daemon=True).start()
-    
-    print("🤖 Gold Bot Deployed to Railway. Monitoring...")
+    print(f"🤖 Monitoring {TICKER} at ${INTERVAL} intervals...")
     last_signal = "HOLD"
     while True:
         try:
             last_signal = run_analysis(last_signal)
-            
-            # Wait 15 minutes
-            now = datetime.now()
-            minutes_to_wait = 15 - (now.minute % 15)
-            next_run = (now + timedelta(minutes=minutes_to_wait)).replace(second=5, microsecond=0)
-            
-            while datetime.now() < next_run:
-                time.sleep(10)
-                
+            time.sleep(900) # Check every 15 mins
         except Exception as e:
             print(f"❌ Error: {e}")
             time.sleep(60)
