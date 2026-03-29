@@ -19,6 +19,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", 8080)) 
 
 TICKER = "GC=F" 
+# The typical difference between Futures and Spot (~$29.30 currently)
+# This allows the AI to use high-quality Futures data while showing you Spot prices.
+BASIS_DIFF = 29.30 
+
 INTERVAL = "15m"
 PERIOD = "59d"
 HORIZON = 12
@@ -37,7 +41,6 @@ def send_telegram(message):
     except: pass
 
 def command_listener():
-    """Independent thread for instant Telegram replies"""
     global target_price, last_update_id
     print("📡 Telegram Listener Active...")
     
@@ -54,43 +57,30 @@ def command_listener():
                         try:
                             val = float(msg.split(" ")[1])
                             target_price = val
-                            send_telegram(f"🎯 **Target Set!**\nAlert at: **${target_price}**")
+                            send_telegram(f"🎯 **Target Set!**\nAlert at Spot Price: **${target_price}**")
                         except:
-                            send_telegram("❌ Use: `/set 4500`")
+                            send_telegram("❌ Use: `/set 4495`")
                     
                     elif msg == "/stop":
                         target_price = None
                         send_telegram("🛑 **Target Cleared.**")
                     
                     elif msg == "/price":
-                        try:
-                            # Try to get live 1-minute data
-                            data = yf.download(TICKER, period="1d", interval="1m", progress=False)
-                            
-                            # CRITICAL FIX: Check if data actually exists
-                            if data is not None and not data.empty:
-                                if isinstance(data.columns, pd.MultiIndex):
-                                    data.columns = data.columns.get_level_values(0)
-                                price = data['Close'].iloc[-1]
-                                send_telegram(f"💰 **Live Gold:** ${float(price):.2f}")
-                            else:
-                                # Fallback to last Friday's price
-                                hist = yf.download(TICKER, period="5d", interval="1d", progress=False)
-                                if isinstance(hist.columns, pd.MultiIndex):
-                                    hist.columns = hist.columns.get_level_values(0)
-                                price = hist['Close'].iloc[-1]
-                                send_telegram(f"😴 **Market Closed.**\nLast Close: **${float(price):.2f}**\n*Opens Sunday 6PM ET*")
-                        except Exception as e:
-                            send_telegram(f"⚠️ Price check failed. Error: {str(e)}")
+                        data = yf.download(TICKER, period="1d", interval="1m", progress=False)
+                        if data.empty:
+                            hist = yf.download(TICKER, period="5d", interval="1d", progress=False)
+                            if isinstance(hist.columns, pd.MultiIndex): hist.columns = hist.columns.get_level_values(0)
+                            spot_est = hist['Close'].iloc[-1] - BASIS_DIFF
+                            send_telegram(f"😴 **Market Closed.**\nEst. Spot: **${float(spot_est):.2f}**")
+                        else:
+                            if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
+                            spot_price = data['Close'].iloc[-1] - BASIS_DIFF
+                            send_telegram(f"💰 **Current Gold Spot:** ${float(spot_price):.2f}")
 
                     elif msg == "/status":
-                        status = f"Target: `${target_price if target_price else 'None'}`"
-                        send_telegram(f"🤖 **Bot Status**\n{status}")
-            
+                        send_telegram(f"🤖 **Bot Status**\nTarget: `${target_price if target_price else 'None'}`")
             time.sleep(2)
-        except Exception as e:
-            print(f"Listener Error: {e}")
-            time.sleep(10)
+        except: time.sleep(10)
 
 # --- AI & ANALYSIS ---
 def run_analysis(last_signal):
@@ -98,31 +88,30 @@ def run_analysis(last_signal):
     print(f"🕒 Market Check: {datetime.now().strftime('%H:%M:%S')}")
     
     df = yf.download(TICKER, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
-    
-    # Check if market is active before running AI
     if df is None or df.empty or len(df) < 100:
-        print("⚠️ Market is closed or data is empty. Skipping analysis...")
         return last_signal
 
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     
-    # Indicators
-    df["RSI"] = 100 - (100 / (1 + (df['Close'].diff().where(lambda x: x>0, 0).rolling(14).mean() / 
-                                   df['Close'].diff().where(lambda x: x<0, 0).abs().rolling(14).mean())))
-    df["EMA"] = df["Close"].ewm(span=100, adjust=False).mean()
-    df["ATR"] = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1).rolling(14).mean()
+    # Convert all prices to Spot for the user/alerts
+    df['Spot_Close'] = df['Close'] - BASIS_DIFF
+    current_spot = df['Spot_Close'].iloc[-1]
+    
+    # RSI & EMA using Spot prices
+    df["RSI"] = 100 - (100 / (1 + (df['Spot_Close'].diff().where(lambda x: x>0, 0).rolling(14).mean() / 
+                                   df['Spot_Close'].diff().where(lambda x: x<0, 0).abs().rolling(14).mean())))
+    df["EMA"] = df["Spot_Close"].ewm(span=100, adjust=False).mean()
+    df["ATR"] = pd.concat([df['High']-df['Low'], (df['High']-df['Spot_Close'].shift()).abs()], axis=1).max(axis=1).rolling(14).mean()
     feat_data = df.dropna()
 
-    current_price = feat_data['Close'].iloc[-1]
-    
-    # Target Alert
+    # Manual Price Alert Check
     if target_price:
-        if current_price >= target_price:
-            send_telegram(f"🚀 **TARGET HIT!**\nGold is at **${current_price:.2f}**")
+        if current_spot >= target_price:
+            send_telegram(f"🚀 **SPOT TARGET REACHED!**\nGold is at **${current_spot:.2f}**")
             target_price = None
 
-    # AI Training
-    future_change = (feat_data["Close"].shift(-HORIZON) - feat_data["Close"])
+    # ML Training
+    future_change = (feat_data["Spot_Close"].shift(-HORIZON) - feat_data["Spot_Close"])
     feat_data["target"] = 1
     feat_data.loc[future_change > (feat_data["ATR"] * 0.5), "target"] = 2
     feat_data.loc[future_change < -(feat_data["ATR"] * 0.5), "target"] = 0
@@ -136,18 +125,18 @@ def run_analysis(last_signal):
     model.fit(X, y)
 
     probs = model.predict_proba(feat_data[["RSI", "EMA"]].iloc[-1:])[0]
-    trend_up = current_price > feat_data["EMA"].iloc[-1]
+    trend_up = current_spot > feat_data["EMA"].iloc[-1]
     
     current_signal = "HOLD"
     if probs[2] >= CONF_THRESHOLD and trend_up: current_signal = "BUY"
     elif probs[0] >= CONF_THRESHOLD and not trend_up: current_signal = "SELL"
 
     if current_signal != last_signal:
-        send_telegram(f"🔔 **SIGNAL CHANGE**\nAction: **{current_signal}**\nPrice: ${current_price:.2f}")
+        send_telegram(f"🔔 **AI SIGNAL**\nSpot Price: **${current_spot:.2f}**\nAction: **{current_signal}**")
     
     return current_signal
 
-# --- RAILWAY SERVER ---
+# --- SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers()
@@ -157,14 +146,14 @@ def main():
     threading.Thread(target=HTTPServer(('0.0.0.0', PORT), HealthCheckHandler).serve_forever, daemon=True).start()
     threading.Thread(target=command_listener, daemon=True).start()
     
-    print("🤖 AI Gold Bot Ready.")
+    print("🤖 AI Gold Bot (Spot-Adjusted) Ready.")
     last_signal = "HOLD"
     while True:
         try:
             last_signal = run_analysis(last_signal)
             time.sleep(900)
         except Exception as e:
-            print(f"Main Loop Error: {e}")
+            print(f"Main Error: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
